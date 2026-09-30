@@ -207,6 +207,36 @@ async def lifespan(app):
                         r2 NUMERIC,
                         promoted_at TIMESTAMPTZ DEFAULT NOW()
                     );
+                    CREATE TABLE IF NOT EXISTS hp_applications (
+                        case_id TEXT PRIMARY KEY,
+                        status TEXT NOT NULL DEFAULT 'submitted',
+                        full_name TEXT,
+                        date_of_birth TEXT,
+                        gender TEXT,
+                        phone TEXT,
+                        email TEXT,
+                        region TEXT,
+                        occupation TEXT,
+                        national_id TEXT,
+                        medical_data JSONB,
+                        consent JSONB,
+                        document_id TEXT,
+                        reviewer_id TEXT,
+                        decision_notes TEXT,
+                        decided_at TIMESTAMPTZ,
+                        submitted_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                    CREATE TABLE IF NOT EXISTS hp_application_events (
+                        id SERIAL PRIMARY KEY,
+                        case_id TEXT NOT NULL,
+                        event TEXT NOT NULL,
+                        actor TEXT,
+                        at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                    CREATE INDEX IF NOT EXISTS hp_app_status_idx
+                        ON hp_applications (status, submitted_at DESC);
+                    CREATE INDEX IF NOT EXISTS hp_app_events_case_idx
+                        ON hp_application_events (case_id, at);
                 """)
                 log.info("Schema migrations OK")
             except Exception as e: log.warning(f"Schema migration: {e}")
@@ -226,7 +256,10 @@ async def mw(request:Request,call_next):
     if not _rl(ip): return JSONResponse(429,{"detail":"Rate limit exceeded"})
     # Body size guard
     cl=request.headers.get("content-length")
-    body_limit = 52428800 if request.url.path.startswith("/api/v2/ailab/") else MAX_BODY  # 50MB for AI Lab uploads
+    _p = request.url.path
+    if _p.startswith("/api/v2/ailab/"):      body_limit = 52428800   # 50MB for AI Lab uploads
+    elif _p.startswith("/api/v1/documents/"): body_limit = 10485760  # 10MB for applicant documents
+    else:                                     body_limit = MAX_BODY
     if cl and int(cl)>body_limit: return JSONResponse(413,{"detail":"Payload too large"})
     request.state.rid=str(uuid.uuid4())[:12]
     r=await call_next(request)
@@ -950,6 +983,221 @@ async def ailab_list_files():
     """List all uploaded files in AI Lab"""
     return {"files": list(_ailab_files.values())}
 
+
+# ── v1 application pipeline ───────────────────────────────────────────────────
+# Underwriter Review Dashboard, Application Wizard and Status Tracker all talk to
+# /api/v1/applications. Backed by Postgres when DATABASE_URL is set; otherwise an
+# in-process store seeded with demo cases so the queue is never empty.
+
+APP_STATUSES = {"submitted", "in_review", "approved", "declined", "referred"}
+DOC_DIR = os.getenv("DOC_DIR", "/tmp/hp_documents")
+
+_mem_apps: dict = {}
+_mem_events: dict = defaultdict(list)
+
+def _new_case_id() -> str:
+    return f"DAC-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{secrets.token_hex(3).upper()}"
+
+def _seed_memory():
+    if _mem_apps: return
+    now = datetime.now(timezone.utc)
+    demo = [
+        ("DAC-DEMO0001", "submitted", "Sovann Pich", "1980-05-15", "Male", "Phnom Penh",
+         "Office/Desk", "+855 12 345 678", "sovann@example.com", 2,
+         {"smokingStatus": "Never", "preexistingConditions": ["Hypertension"],
+          "exerciseFrequency": "Light", "height": 170, "weight": 80,
+          "bloodPressure": "130/85", "familyHistory": "Heart Disease",
+          "currentMedications": "Amlodipine 5mg", "alcoholConsumption": "Occasional"}),
+        ("DAC-DEMO0002", "in_review", "Channary Kim", "1975-11-28", "Female", "Siem Reap",
+         "Healthcare", "+855 92 876 543", "channary@example.com", 24,
+         {"smokingStatus": "Current", "preexistingConditions": ["Diabetes", "Hypertension"],
+          "exerciseFrequency": "Sedentary", "height": 158, "weight": 75,
+          "bloodPressure": "145/92", "familyHistory": "Diabetes, Heart Disease",
+          "currentMedications": "Metformin, Lisinopril", "alcoholConsumption": "Never"}),
+        ("DAC-DEMO0003", "submitted", "Dara Meas", "1995-03-10", "Male", "Battambang",
+         "Retail/Service", "+855 78 234 567", "dara@example.com", 0.5,
+         {"smokingStatus": "Never", "preexistingConditions": ["None"],
+          "exerciseFrequency": "Active", "height": 175, "weight": 68,
+          "bloodPressure": "118/75", "familyHistory": "None",
+          "currentMedications": "None", "alcoholConsumption": "Never"}),
+    ]
+    for cid, st, name, dob, sex, region, occ, phone, email, hrs_ago, md in demo:
+        ts = now - timedelta(hours=hrs_ago)
+        _mem_apps[cid] = {"case_id": cid, "status": st, "full_name": name,
+            "date_of_birth": dob, "gender": sex, "region": region, "occupation": occ,
+            "phone": phone, "email": email, "national_id": None, "medical_data": md,
+            "consent": None, "document_id": None, "reviewer_id": None,
+            "decision_notes": None, "decided_at": None, "submitted_at": ts}
+        _mem_events[cid] = [{"event": "Application received", "actor": "portal", "at": ts}]
+        if st == "in_review":
+            _mem_events[cid].append({"event": "Initial review", "actor": "system",
+                                     "at": ts + timedelta(minutes=20)})
+
+_seed_memory()
+
+def _iso(v):
+    if v is None: return None
+    return v.isoformat() if hasattr(v, "isoformat") else str(v)
+
+def _row_out(a: dict) -> dict:
+    return {
+        "id": a["case_id"], "case_id": a["case_id"], "status": a["status"],
+        "full_name": a.get("full_name"), "date_of_birth": a.get("date_of_birth"),
+        "gender": a.get("gender"), "region": a.get("region"),
+        "occupation": a.get("occupation"), "phone": a.get("phone"),
+        "email": a.get("email"), "medical_data": a.get("medical_data") or {},
+        "document_id": a.get("document_id"), "reviewer_id": a.get("reviewer_id"),
+        "decision_notes": a.get("decision_notes"),
+        "decided_at": _iso(a.get("decided_at")),
+        "submitted_at": _iso(a.get("submitted_at")),
+    }
+
+def _timeline(app_row: dict, events: list) -> list:
+    st = app_row["status"]
+    def when(name):
+        for e in events:
+            if e["event"] == name: return _iso(e["at"])
+        return None
+    decided = st in ("approved", "declined", "referred")
+    return [
+        {"event": "Application received", "timestamp": _iso(app_row.get("submitted_at")), "done": True},
+        {"event": "Initial review", "timestamp": when("Initial review"),
+         "done": st != "submitted"},
+        {"event": "Underwriter decision", "timestamp": _iso(app_row.get("decided_at")),
+         "done": decided},
+        {"event": "Policy issued", "timestamp": None, "done": st == "approved"},
+    ]
+
+class ApplicationIn(BaseModel):
+    personal: dict = Field(default_factory=dict)
+    medical: dict = Field(default_factory=dict)
+    consent: Optional[dict] = None
+    documentId: Optional[str] = None
+
+class DecisionIn(BaseModel):
+    outcome: str
+    notes: Optional[str] = ""
+    reviewer_id: str
+
+@app.post("/api/v1/applications")
+async def v1_create_application(body: ApplicationIn):
+    p, m = body.personal or {}, body.medical or {}
+    cid = _new_case_id()
+    now = datetime.now(timezone.utc)
+    row = {"case_id": cid, "status": "submitted",
+           "full_name": p.get("fullName"), "date_of_birth": p.get("dateOfBirth"),
+           "gender": p.get("gender"), "phone": p.get("phone"), "email": p.get("email"),
+           "region": p.get("region"), "occupation": p.get("occupation"),
+           "national_id": p.get("nationalId"), "medical_data": m,
+           "consent": body.consent, "document_id": body.documentId,
+           "reviewer_id": None, "decision_notes": None, "decided_at": None,
+           "submitted_at": now}
+    if db_pool:
+        async with db_pool.acquire() as c:
+            await c.execute("""
+                INSERT INTO hp_applications (case_id,status,full_name,date_of_birth,gender,
+                    phone,email,region,occupation,national_id,medical_data,consent,
+                    document_id,submitted_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13,$14)
+            """, cid, "submitted", row["full_name"], row["date_of_birth"], row["gender"],
+                 row["phone"], row["email"], row["region"], row["occupation"],
+                 row["national_id"], json.dumps(m), json.dumps(body.consent or {}),
+                 row["document_id"], now)
+            await c.execute("INSERT INTO hp_application_events (case_id,event,actor,at) VALUES ($1,$2,$3,$4)",
+                            cid, "Application received", "portal", now)
+    else:
+        _mem_apps[cid] = row
+        _mem_events[cid] = [{"event": "Application received", "actor": "portal", "at": now}]
+    log.info(f"application {cid} received")
+    return {"case_id": cid, "id": cid, "status": "submitted",
+            "submitted_at": now.isoformat()}
+
+@app.get("/api/v1/applications")
+async def v1_list_applications(status: str = "submitted,in_review",
+                               user: dict = Depends(get_current_staff)):
+    wanted = [s.strip() for s in status.split(",") if s.strip() in APP_STATUSES]
+    if not wanted: wanted = ["submitted", "in_review"]
+    if db_pool:
+        async with db_pool.acquire() as c:
+            rows = await c.fetch("""
+                SELECT * FROM hp_applications WHERE status = ANY($1::text[])
+                ORDER BY submitted_at DESC LIMIT 200
+            """, wanted)
+        out = []
+        for r in rows:
+            d = dict(r)
+            md = d.get("medical_data")
+            d["medical_data"] = json.loads(md) if isinstance(md, str) else (md or {})
+            out.append(_row_out(d))
+    else:
+        out = [_row_out(a) for a in sorted(_mem_apps.values(),
+               key=lambda x: x["submitted_at"], reverse=True) if a["status"] in wanted]
+    return {"applications": out, "count": len(out), "status": wanted}
+
+@app.get("/api/v1/applications/{case_id}/status")
+async def v1_application_status(case_id: str):
+    if db_pool:
+        async with db_pool.acquire() as c:
+            r = await c.fetchrow("SELECT * FROM hp_applications WHERE case_id=$1", case_id)
+            if not r: raise HTTPException(404, "Case not found")
+            ev = await c.fetch("SELECT event,actor,at FROM hp_application_events WHERE case_id=$1 ORDER BY at", case_id)
+        a = dict(r); events = [dict(e) for e in ev]
+    else:
+        a = _mem_apps.get(case_id)
+        if not a: raise HTTPException(404, "Case not found")
+        events = _mem_events.get(case_id, [])
+    notes = {"submitted": "Your application has been received and is queued for review.",
+             "in_review": "Your application is currently under review.",
+             "approved": "Your application has been approved.",
+             "declined": "Your application was not accepted.",
+             "referred": "Your application has been referred for further review."}
+    return {"case_id": case_id, "status": a["status"],
+            "submitted_at": _iso(a.get("submitted_at")),
+            "applicant_name": a.get("full_name") or "Applicant",
+            "note": notes.get(a["status"], ""),
+            "timeline": _timeline(a, events)}
+
+@app.post("/api/v1/applications/{case_id}/decision")
+async def v1_application_decision(case_id: str, body: DecisionIn,
+                                  user: dict = Depends(require_roles("admin", "underwriter"))):
+    outcome = body.outcome.strip().lower()
+    if outcome not in {"approved", "declined", "referred", "in_review"}:
+        raise HTTPException(400, "outcome must be approved, declined, referred or in_review")
+    if not body.reviewer_id.strip():
+        raise HTTPException(400, "reviewer_id is required")
+    now = datetime.now(timezone.utc)
+    if db_pool:
+        async with db_pool.acquire() as c:
+            r = await c.execute("""
+                UPDATE hp_applications SET status=$1, reviewer_id=$2, decision_notes=$3,
+                       decided_at=$4 WHERE case_id=$5
+            """, outcome, body.reviewer_id, body.notes or "", now, case_id)
+            if r.endswith("0"): raise HTTPException(404, "Case not found")
+            await c.execute("INSERT INTO hp_application_events (case_id,event,actor,at) VALUES ($1,$2,$3,$4)",
+                            case_id, "Underwriter decision", body.reviewer_id, now)
+    else:
+        a = _mem_apps.get(case_id)
+        if not a: raise HTTPException(404, "Case not found")
+        a.update(status=outcome, reviewer_id=body.reviewer_id,
+                 decision_notes=body.notes or "", decided_at=now)
+        _mem_events[case_id].append({"event": "Underwriter decision",
+                                     "actor": body.reviewer_id, "at": now})
+    log.info(f"application {case_id} -> {outcome} by {body.reviewer_id}")
+    return {"ok": True, "case_id": case_id, "status": outcome,
+            "decided_at": now.isoformat(), "reviewer_id": body.reviewer_id}
+
+@app.post("/api/v1/documents/upload")
+async def v1_document_upload(file: UploadFile = File(...)):
+    raw = await file.read()
+    if len(raw) > 10 * 1024 * 1024:
+        raise HTTPException(413, "Document must be 10 MB or smaller")
+    os.makedirs(DOC_DIR, exist_ok=True)
+    did = f"doc_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{secrets.token_hex(4)}"
+    ext = os.path.splitext(file.filename or "")[1][:10]
+    with open(os.path.join(DOC_DIR, did + ext), "wb") as fh:
+        fh.write(raw)
+    return {"document_id": did, "documentId": did,
+            "filename": file.filename, "size": len(raw)}
 
 @app.exception_handler(Exception)
 async def err(request:Request,exc:Exception):
