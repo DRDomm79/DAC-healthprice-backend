@@ -882,7 +882,13 @@ async def ailab_analyze(request: Request):
             system=AILAB_SYSTEM_PROMPT + data_context,
             messages=messages,
         )
-        ai_response = response.content[0].text
+        # The first block is not always text — with extended thinking the model
+        # returns a ThinkingBlock first, which has no .text. Join the text blocks.
+        ai_response = "".join(
+            b.text for b in response.content if getattr(b, "type", "") == "text"
+        ).strip()
+        if not ai_response:
+            raise HTTPException(502, "Model returned no text content")
 
         # Parse suggestions from response
         suggestions = []
