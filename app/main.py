@@ -253,14 +253,14 @@ async def mw(request:Request,call_next):
     if CF_SECRET and request.url.path not in ("/auth/login", "/api/v2/chat", "/api/v2/ailab/upload", "/api/v2/ailab/analyze", "/api/v2/ailab/execute", "/api/v2/ailab/files") and request.headers.get("X-CF-Secret")!=CF_SECRET:
         return JSONResponse(status_code=403,content={"detail":"Direct API access not permitted. Use the official frontend."})
     # Rate limit
-    if not _rl(ip): return JSONResponse(429,{"detail":"Rate limit exceeded"})
+    if not _rl(ip): return JSONResponse({"detail":"Rate limit exceeded"},status_code=429)
     # Body size guard
     cl=request.headers.get("content-length")
     _p = request.url.path
     if _p.startswith("/api/v2/ailab/"):      body_limit = 52428800   # 50MB for AI Lab uploads
     elif _p.startswith("/api/v1/documents/"): body_limit = 10485760  # 10MB for applicant documents
     else:                                     body_limit = MAX_BODY
-    if cl and int(cl)>body_limit: return JSONResponse(413,{"detail":"Payload too large"})
+    if cl and int(cl)>body_limit: return JSONResponse({"detail":"Payload too large"},status_code=413)
     request.state.rid=str(uuid.uuid4())[:12]
     r=await call_next(request)
     # Security headers
@@ -1203,4 +1203,4 @@ async def v1_document_upload(file: UploadFile = File(...)):
 async def err(request:Request,exc:Exception):
     rid=getattr(request.state,"rid","?") if hasattr(request,"state") else "?"
     log.error(f"[{rid}] {exc}",exc_info=True)
-    return JSONResponse(500,{"detail":"Internal server error","request_id":rid})
+    return JSONResponse({"detail":"Internal server error","request_id":rid},status_code=500)
