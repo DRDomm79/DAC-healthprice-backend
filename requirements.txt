@@ -14,3 +14,4 @@ openpyxl
 matplotlib
 seaborn
 statsmodels
+anthropic==1.11.0
