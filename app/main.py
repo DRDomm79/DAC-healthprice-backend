@@ -772,17 +772,44 @@ WHEN TO USE CODE vs WHEN TO JUST CHAT:
 - For QUESTIONS (e.g. "what is this data?", "explain loss ratio", "what should I do next?") → just answer in plain text, NO code needed.
 - For ACTIONS that need computation (e.g. "clean this data", "plot a chart", "build a model", "show summary statistics", "run EDA") → include executable Python code inside ```python``` blocks. The code will be auto-executed.
 
+CHARTS — READ THIS CAREFULLY:
+- A chart only appears for the user if your code SAVES IT during THIS reply. There is
+  no memory of files between replies and nothing renders on its own.
+- NEVER say a chart "has been generated", "is saved", "should render above", or
+  "should appear in your interface". If the user asks to see a chart — even one you
+  described or produced in an earlier message — write the full code again now,
+  including loading the data, and save it.
+- Save every chart with: plt.savefig("/tmp/ailab_output/<name>.png", dpi=150, bbox_inches="tight")
+  then plt.close(). Use a descriptive name, one file per chart, e.g.
+  claims_by_region.png, frequency_trend.png.
+- Give every chart a title, axis labels with units, and a legend when there is more
+  than one series.
+
 CODING RULES (only when code is needed):
-- Always load data with: df = pd.read_csv("/tmp/ailab_data/{filename}")
-- For charts, save to file: plt.savefig("/tmp/ailab_output/chart.png", dpi=150, bbox_inches="tight") then plt.close()
-- Use unique chart filenames when generating multiple charts (e.g. chart_1.png, chart_2.png)
+- Always load data with: df = pd.read_csv("/tmp/ailab_data/{filename}") — use the full
+  absolute path, never a relative one.
 - Print results clearly with labels
 - Use pandas, numpy, scikit-learn, statsmodels, matplotlib, and seaborn
 - For actuarial models, prefer Poisson GLM for frequency and Gamma GLM for severity
 - Show model coefficients, metrics (R², MAE, RMSE, AUC-ROC), and interpretation
 - For data cleaning, show before/after statistics
 - For EDA, generate multiple relevant charts
-- Always add brief actuarial interpretation of results
+
+HOW TO EXPLAIN, SO AN ACTUARY CAN FOLLOW IT:
+Write for a working actuary who is reading quickly. Keep the prose short and concrete.
+- Open with one sentence saying what you did and what came out of it.
+- When you produce a chart, say in one or two sentences what it shows and what the
+  reader should take from it — the pattern, the outlier, the trend — not a description
+  of the axes.
+- Put numbers in the text. "Loss ratio rose from 61% to 74% between 2022 and 2024"
+  beats "the loss ratio increased".
+- Use a markdown table when comparing more than two things. Tables render properly.
+- Finish with what it means for pricing, reserving or underwriting, and name the one
+  thing worth doing next.
+- Do not pad with restatements of the question, apologies, or lists of what you could
+  have done. No emoji.
+- Say plainly when the data cannot support a conclusion — small samples, missing
+  exposure, no claim dates — rather than giving a confident answer anyway.
 
 SUGGESTIONS:
 At the end of EVERY response, add exactly 3 context-aware follow-up suggestions. Format them as:
@@ -938,13 +965,38 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
 warnings.filterwarnings('ignore')
-import os
+import os, glob
 os.makedirs('/tmp/ailab_output', exist_ok=True)
+# Run inside the output directory so a relative plt.savefig("chart.png")
+# lands where the API collects charts from.
+os.chdir('/tmp/ailab_output')
+plt.rcParams['figure.figsize'] = (9, 5)
+plt.rcParams['figure.dpi'] = 120
+plt.rcParams['savefig.bbox'] = 'tight'
+plt.rcParams['axes.grid'] = True
+plt.rcParams['grid.alpha'] = 0.25
 
 try:
 {chr(10).join('    ' + line for line in code.split(chr(10)))}
 except Exception as e:
+    import traceback
     print(f"ERROR: {{e}}")
+    traceback.print_exc()
+
+# Safety net: save any figure the code built but never wrote to disk
+# (e.g. it called plt.show() instead of plt.savefig()).
+try:
+    _existing = set(glob.glob('/tmp/ailab_output/*.png'))
+    for _i, _num in enumerate(plt.get_fignums(), 1):
+        _fig = plt.figure(_num)
+        if not _fig.get_axes():
+            continue
+        _path = f'/tmp/ailab_output/chart_{{_i:02d}}.png'
+        if _path not in _existing:
+            _fig.savefig(_path, dpi=120, bbox_inches='tight')
+    plt.close('all')
+except Exception:
+    pass
 """
 
     # Write to temp file and execute
